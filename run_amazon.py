@@ -14,11 +14,18 @@ Steps:
   9. Evaluate on test set
  10. Print metrics: hit@k, ndcg@k, mrr@k, coverage, ILD
 
-Usage:
-  cd /workspace/recsys
+Default data files:
+  review_path : /workspace/All_Amazon_Review_5_10M_filtered.json
+  meta_path   : /workspace/All_Amazon_Meta_in_Review.json
+
+Usage (uses defaults):
+  cd /workspace/LM_Submodular_RL
+  python run_amazon.py
+
+Full options:
   python run_amazon.py \\
-      --review_path /workspace/All_Amazon_Review_5.json.gz \\
-      --meta_path   /workspace/All_Amazon_Meta.json.gz \\
+      --review_path /workspace/All_Amazon_Review_5_10M_filtered.json \\
+      --meta_path   /workspace/All_Amazon_Meta_in_Review.json \\
       --max_users   2000 \\
       --epochs      3 \\
       --steps_per_epoch 200 \\
@@ -27,8 +34,6 @@ Usage:
 
 Quick smoke-test (tiny subset, CPU only):
   python run_amazon.py \\
-      --review_path /workspace/All_Amazon_Review_5.json.gz \\
-      --meta_path   /workspace/All_Amazon_Meta.json.gz \\
       --max_users   200 \\
       --epochs      1 \\
       --steps_per_epoch 50 \\
@@ -92,6 +97,101 @@ def compute_ild(slates: List[List[int]], embeddings: torch.Tensor) -> float:
     from utils.metrics import diversity_score
     scores = [diversity_score(s, embeddings) for s in slates if len(s) >= 2]
     return float(np.mean(scores)) if scores else 0.0
+
+
+def save_split_inspection(
+    train_steps, val_steps, test_steps,
+    title_map: Dict[int, str],
+    output_dir: str,
+    n_samples: int = 20,
+) -> None:
+    """
+    Save train/val/test split statistics and sample records for inspection.
+
+    Outputs (in output_dir/split_inspection/):
+      stats.json          — count, unique users/items, history length stats, budget stats
+      train_samples.json  — first n_samples TrajectorySteps (human-readable)
+      val_samples.json
+      test_samples.json
+    """
+    import collections
+
+    inspect_dir = os.path.join(output_dir, "split_inspection")
+    os.makedirs(inspect_dir, exist_ok=True)
+
+    def _step_stats(steps) -> dict:
+        if not steps:
+            return {}
+        hist_lens = [len(s.history_ids) for s in steps]
+        budgets = [s.budget for s in steps]
+        unique_users = len({s.user_id for s in steps})
+        unique_items = len({s.item_id for s in steps})
+        # items per user distribution
+        user_counts = collections.Counter(s.user_id for s in steps)
+        counts = list(user_counts.values())
+        return {
+            "n_steps": len(steps),
+            "unique_users": unique_users,
+            "unique_target_items": unique_items,
+            "steps_per_user": {
+                "min": int(min(counts)),
+                "max": int(max(counts)),
+                "mean": round(float(np.mean(counts)), 2),
+                "median": round(float(np.median(counts)), 2),
+            },
+            "history_length": {
+                "min": int(min(hist_lens)),
+                "max": int(max(hist_lens)),
+                "mean": round(float(np.mean(hist_lens)), 2),
+            },
+            "budget": {
+                "min": round(float(min(budgets)), 4),
+                "max": round(float(max(budgets)), 4),
+                "mean": round(float(np.mean(budgets)), 4),
+            },
+        }
+
+    def _step_to_dict(s) -> dict:
+        history_titles = [title_map.get(i, f"item_{i}") for i in s.history_ids]
+        target_title   = title_map.get(s.item_id, f"item_{s.item_id}")
+        return {
+            "user_id":       s.user_id,
+            "target_item_id":   s.item_id,
+            "target_title":  target_title,
+            "history_ids":   s.history_ids,
+            "history_titles": history_titles,
+            "history_stars": s.history_extras,
+            "budget":        round(s.budget, 4),
+            "split":         s.split,
+        }
+
+    splits = {"train": train_steps, "val": val_steps, "test": test_steps}
+
+    # ---- Stats ----
+    stats = {split: _step_stats(steps) for split, steps in splits.items()}
+    stats_path = os.path.join(inspect_dir, "stats.json")
+    with open(stats_path, "w") as f:
+        json.dump(stats, f, indent=2)
+    print(f"  Split stats saved -> {stats_path}")
+
+    # ---- Sample records ----
+    for split, steps in splits.items():
+        sample_records = [_step_to_dict(s) for s in steps[:n_samples]]
+        out_path = os.path.join(inspect_dir, f"{split}_samples.json")
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(sample_records, f, indent=2, ensure_ascii=False)
+        print(f"  {split:5s} samples ({len(sample_records)}) -> {out_path}")
+
+    # ---- Print summary to stdout ----
+    print(f"\n  {'Split':<8} {'Steps':>8} {'Users':>8} {'Items':>8} "
+          f"{'Steps/User(mean)':>18} {'HistLen(mean)':>14} {'Budget(mean)':>14}")
+    print(f"  {'-'*80}")
+    for split, st in stats.items():
+        print(f"  {split:<8} {st['n_steps']:>8,} {st['unique_users']:>8,} "
+              f"{st['unique_target_items']:>8,} "
+              f"{st['steps_per_user']['mean']:>18.2f} "
+              f"{st['history_length']['mean']:>14.2f} "
+              f"{st['budget']['mean']:>14.4f}")
 
 
 # ---------------------------------------------------------------------------
@@ -313,6 +413,59 @@ def main(args: argparse.Namespace) -> None:
     make_query = make_query_fn(title_map)
 
     # -----------------------------------------------------------------------
+    # 7b. Save split inspection files
+    # -----------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("Step 7b: Saving split inspection")
+    print(f"{'='*60}")
+    save_split_inspection(
+        train_steps, val_steps, test_steps,
+        title_map=title_map,
+        output_dir=args.output_dir,
+        n_samples=50,
+    )
+
+    # -----------------------------------------------------------------------
+    # 7b-2. Log co-purchase graph stats
+    # -----------------------------------------------------------------------
+    from data.amazon_loader import build_copurchase_graph
+    graph = build_copurchase_graph(train_ds)
+    gs = graph["stats"]
+    print(f"\n  Co-purchase graph (also_buy):")
+    print(f"    Items with neighbors : {gs['items_with_copurchase']:,} / {gs['n_items']:,}")
+    print(f"    Total edges          : {gs['copurchase_edges']:,}")
+    print(f"  Co-view graph (also_view):")
+    print(f"    Items with neighbors : {gs['items_with_coview']:,} / {gs['n_items']:,}")
+    print(f"    Total edges          : {gs['coview_edges']:,}")
+
+    # -----------------------------------------------------------------------
+    # 7c. Build and save DPO pairs (for reranker / DPO fine-tuning)
+    # -----------------------------------------------------------------------
+    print(f"\n{'='*60}")
+    print("Step 7c: Building DPO preference pairs")
+    print(f"{'='*60}")
+
+    dpo_dir = os.path.join(args.output_dir, "dpo_pairs")
+    dpo_files = {s: os.path.join(dpo_dir, f"{s}.jsonl") for s in ("train", "val", "test")}
+    dpo_exists = all(os.path.exists(p) for p in dpo_files.values())
+
+    if dpo_exists:
+        print(f"  DPO pairs already exist — skipping generation.")
+        for split_name, path in dpo_files.items():
+            n = sum(1 for _ in open(path, encoding="utf-8"))
+            print(f"  {split_name:5s}: {n:,} pairs (cached) <- {path}")
+    else:
+        from data.amazon_loader import build_dpo_pairs
+        os.makedirs(dpo_dir, exist_ok=True)
+        for split_name, ds in [("train", train_ds), ("val", val_ds), ("test", test_ds)]:
+            pairs = build_dpo_pairs(ds, split=split_name, n_negatives=4, seed=args.seed)
+            out_path = dpo_files[split_name]
+            with open(out_path, "w", encoding="utf-8") as f:
+                for pair in pairs:
+                    f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+            print(f"  {split_name:5s}: {len(pairs):,} pairs -> {out_path}")
+
+    # -----------------------------------------------------------------------
     # 8. Train (RL + submodular)
     # -----------------------------------------------------------------------
     print(f"\n{'='*60}")
@@ -444,8 +597,12 @@ def parse_args() -> argparse.Namespace:
     )
 
     # Data
-    p.add_argument("--review_path",  required=True, help="Path to All_Amazon_Review_5.json.gz")
-    p.add_argument("--meta_path",    required=True, help="Path to All_Amazon_Meta.json.gz")
+    p.add_argument("--review_path",
+                   default="/workspace/All_Amazon_Review_5_10M_filtered.json",
+                   help="Path to review JSONL file")
+    p.add_argument("--meta_path",
+                   default="/workspace/All_Amazon_Meta_in_Review.json",
+                   help="Path to metadata JSONL file")
     p.add_argument("--max_items",    type=int,   default=50_000,
                    help="Load first N products from meta file (avoids scanning full 12GB)")
     p.add_argument("--max_users",    type=int,   default=2000,

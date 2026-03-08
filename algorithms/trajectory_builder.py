@@ -1,14 +1,4 @@
-"""
-Algorithm 1: BuildTrajectories
 
-Builds (x_t, B_t, y_t) tuples from Amazon or RetailRocket datasets.
-
-  x_t  = EncodeHistory / EncodeEvents -> context vector
-  B_t  = budget (inferred from prices for Amazon; constant k for RetailRocket)
-  y_t  = ground-truth next item (and event for RetailRocket)
-
-The output is a list of Trajectory namedtuples ready for training.
-"""
 
 from dataclasses import dataclass
 from typing import List, Optional, Tuple

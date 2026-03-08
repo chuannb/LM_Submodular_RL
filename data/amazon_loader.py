@@ -237,24 +237,41 @@ def load_amazon_metadata(
     Parameters
     ----------
     meta_path   : path to .json.gz meta file (may be double-gzipped)
-    keep_asins  : if provided, only load products whose asin is in this set
-    max_records : stop after loading this many records (for fast sampling)
+    keep_asins  : if provided, only load products whose asin is in this set.
+                  When keep_asins is given, max_records is ignored — the full
+                  file is scanned so that ASINs appearing late in the file are
+                  not missed.
+    max_records : stop after loading this many records (only used when
+                  keep_asins is None, for fast catalog sampling)
 
     Returns a DataFrame with columns:
       asin, title, description, price, brand, categories, feature
     """
     records = []
-    for rec in _iter_jsonl(meta_path, max_records=max_records):
-        if keep_asins is not None and rec.get("asin") not in keep_asins:
-            continue
-        records.append(rec)
+    remaining = set(keep_asins) if keep_asins else None  # track unseen ASINs
+
+    # When filtering by keep_asins, scan the full file regardless of max_records.
+    # ASINs are not sorted, so early truncation misses most matches.
+    effective_max = None if keep_asins else max_records
+
+    for rec in _iter_jsonl(meta_path, max_records=effective_max):
+        asin = rec.get("asin")
+        if remaining is not None:
+            if asin not in remaining:
+                continue
+            records.append(rec)
+            remaining.discard(asin)
+            if not remaining:
+                break   # found all requested ASINs — stop early
+        else:
+            records.append(rec)
 
     df = pd.DataFrame(records)
     if df.empty or "asin" not in df.columns:
         return pd.DataFrame(columns=["asin", "title", "description", "price",
                                      "brand", "categories", "feature"])
     keep = ["asin", "title", "description", "price", "brand", "categories", "feature",
-            "category", "main_cat"]
+            "category", "main_cat", "also_buy", "also_view"]
     existing = [c for c in keep if c in df.columns]
     df = df[existing].copy()
 
@@ -264,7 +281,16 @@ def load_amazon_metadata(
     if "categories" not in df.columns:
         df["categories"] = ""
 
-    # Flatten list-type fields to strings
+    # Keep also_buy / also_view as Python lists; fill missing with empty list
+    for col in ["also_buy", "also_view"]:
+        if col in df.columns:
+            df[col] = df[col].apply(
+                lambda x: x if isinstance(x, list) else []
+            )
+        else:
+            df[col] = [[] for _ in range(len(df))]
+
+    # Flatten list-type text fields to strings
     for col in ["description", "feature", "categories", "category"]:
         if col in df.columns:
             df[col] = df[col].apply(
@@ -422,6 +448,24 @@ class AmazonDataset(Dataset):
             if row.Index in self.item2id
         }
 
+        # ---- Co-purchase / co-view graphs (item_id → List[item_id]) ----
+        # Only keep edges where both endpoints are in our catalog.
+        self.copurchase_map: Dict[int, List[int]] = {}   # also_buy
+        self.coview_map: Dict[int, List[int]] = {}        # also_view
+        for row in meta.itertuples():
+            asin = row.Index
+            if asin not in self.item2id:
+                continue
+            src = self.item2id[asin]
+            if hasattr(row, "also_buy") and row.also_buy:
+                neighbors = [self.item2id[a] for a in row.also_buy if a in self.item2id]
+                if neighbors:
+                    self.copurchase_map[src] = neighbors
+            if hasattr(row, "also_view") and row.also_view:
+                neighbors = [self.item2id[a] for a in row.also_view if a in self.item2id]
+                if neighbors:
+                    self.coview_map[src] = neighbors
+
         reviews["item_id"] = reviews["asin"].map(self.item2id)
         reviews["user_id"] = reviews["reviewerID"].map(self.user2id)
         reviews = reviews.dropna(subset=["item_id", "user_id"])
@@ -439,25 +483,35 @@ class AmazonDataset(Dataset):
         train_ratio: float,
         val_ratio: float,
     ) -> None:
+        """
+        Leave-last-2-out split strategy:
+          test  = last item  (t = n-1)         — 1 sample per user
+          val   = second-to-last item (t = n-2) — 1 sample per user
+          train = all earlier steps (t = 1 .. n-3)
+
+        This guarantees every qualifying user contributes exactly 1 test
+        and 1 val sample, avoiding the imbalance caused by temporal ratio
+        splitting for short interaction sequences.
+
+        Minimum requirement: min_interactions >= 3 (so train has ≥1 step).
+        """
         L = self.history_length
         for user_id, group in reviews.groupby("user_id"):
             group = group.sort_values("unixReviewTime")
             items = group["item_id"].tolist()
             stars = group["overall"].tolist()
-            if len(items) < min_interactions:
+            n = len(items)
+            if n < min_interactions:
                 continue
 
-            n = len(items)
-            train_end = int(n * train_ratio)
-            val_end = int(n * (train_ratio + val_ratio))
-
+            # Assign split label per position
             for t in range(1, n):
-                if t < train_end:
-                    s = "train"
-                elif t < val_end:
+                if t == n - 1:
+                    s = "test"
+                elif t == n - 2:
                     s = "val"
                 else:
-                    s = "test"
+                    s = "train"
                 if s != self.split:
                     continue
 
@@ -466,7 +520,14 @@ class AmazonDataset(Dataset):
                 next_item = items[t]
 
                 past_prices = [self.price_map.get(i, 0.0) for i in history]
-                budget = float(np.mean(past_prices)) if past_prices else 0.0
+                # Use max price seen so far as a budget proxy (more meaningful
+                # than mean when prices are 0 due to missing meta)
+                valid_prices = [p for p in past_prices if p > 0.0]
+                budget = float(np.mean(valid_prices)) if valid_prices else 1.0
+
+                # also_buy items of the target that exist in our catalog
+                # → used as implicit positive signals (co-purchased neighbors)
+                copurchase_ids = self.copurchase_map.get(next_item, [])
 
                 self.samples.append({
                     "user_id": user_id,
@@ -475,6 +536,7 @@ class AmazonDataset(Dataset):
                     "history_stars": history_stars,
                     "budget": max(budget, 1.0),
                     "price": self.price_map.get(next_item, 0.0),
+                    "copurchase_ids": copurchase_ids,  # also_buy neighbors in catalog
                     "split": s,
                 })
 
@@ -521,3 +583,202 @@ class AmazonDataset(Dataset):
                 "price": float(row.get("price", 0.0)),
             })
         return products
+
+
+# ---------------------------------------------------------------------------
+# DPO / Reranker pair builder
+# ---------------------------------------------------------------------------
+
+def build_dpo_pairs(
+    dataset: "AmazonDataset",
+    split: str = "train",
+    n_negatives: int = 4,
+    min_positive_stars: float = 4.0,
+    neg_strategy: str = "random_catalog",
+    seed: int = 42,
+) -> List[Dict]:
+    """
+    Build pairwise preference pairs for DPO / reranker fine-tuning.
+
+    For each interaction where the user gave >= min_positive_stars:
+      chosen   = the item actually purchased/reviewed positively
+      rejected = items from the catalog that the user did NOT buy
+                 (sampled according to neg_strategy)
+
+    The "query" is built from the last 3 history item titles
+    (same heuristic used by make_query_fn in run_amazon.py).
+
+    Parameters
+    ----------
+    dataset            : AmazonDataset (already split-aware)
+    split              : which split to use ("train" | "val" | "test")
+    n_negatives        : number of rejected items per pair
+    min_positive_stars : minimum rating to treat an item as "chosen"
+    neg_strategy       : "random_catalog" — random non-interacted items
+    seed               : RNG seed
+
+    Returns list of dicts:
+      {
+        "user_id"      : int,
+        "query"        : str,           # text query from history titles
+        "chosen"       : dict,          # {asin, title, description, price}
+        "rejected"     : List[dict],    # list of n_negatives rejected items
+        "history_ids"  : List[int],
+        "split"        : str,
+      }
+    """
+    import random as _random
+    rng = _random.Random(seed)
+
+    # Collect all catalog product dicts keyed by item_id (int index)
+    all_products: Dict[int, Dict] = {}
+    for asin, idx in dataset.item2id.items():
+        if asin not in dataset.meta.index:
+            continue
+        row = dataset.meta.loc[asin]
+        all_products[idx] = {
+            "asin":        asin,
+            "title":       str(row.get("title", "")),
+            "description": str(row.get("description", "")),
+            "price":       float(row.get("price", 0.0)),
+        }
+
+    all_item_ids = list(all_products.keys())
+    title_map = dataset.title_map
+
+    # Precompute user → set of interacted item_ids to avoid O(n²) scan
+    user_items_map: Dict[int, set] = {}
+    for s in dataset.samples:
+        uid = s["user_id"]
+        if uid not in user_items_map:
+            user_items_map[uid] = set()
+        user_items_map[uid].add(s["item_id"])
+
+    all_item_ids_set = set(all_item_ids)   # O(1) membership checks
+
+    pairs: List[Dict] = []
+
+    for sample in dataset.samples:
+        if sample["split"] != split:
+            continue
+
+        target_asin = dataset.id2item.get(sample["item_id"])
+        if target_asin is None or target_asin not in dataset.meta.index:
+            continue
+
+        target_row = dataset.meta.loc[target_asin]
+        target_title = str(target_row.get("title", ""))
+        if not target_title:
+            continue
+
+        chosen = {
+            "asin":        target_asin,
+            "title":       target_title,
+            "description": str(target_row.get("description", "")),
+            "price":       float(target_row.get("price", 0.0)),
+        }
+
+        # Build query from last 3 history titles
+        history_ids = sample["history_ids"]
+        hist_titles = [title_map.get(i, "") for i in history_ids[-3:]]
+        hist_titles = [t for t in hist_titles if t]
+        query = " ".join(hist_titles) if hist_titles else target_title
+
+        # --- Negative sampling strategy ---
+        user_items = user_items_map.get(sample["user_id"], set()) | {sample["item_id"]}
+
+        chosen_item_id = sample["item_id"]
+        also_buy_set = set(dataset.copurchase_map.get(chosen_item_id, []))
+        also_view_ids = dataset.coview_map.get(chosen_item_id, [])
+
+        # Hard negatives: also_view but NOT also_buy and NOT interacted by user
+        hard_neg_ids = [
+            i for i in also_view_ids
+            if i not in also_buy_set
+            and i not in user_items
+            and i in all_item_ids_set
+        ]
+
+        # Easy negatives: random non-interacted items
+        random_neg_ids = [
+            i for i in all_item_ids
+            if i not in user_items and i not in also_buy_set
+        ]
+
+        # Fill up to n_negatives: prefer hard negatives first
+        n_hard = min(len(hard_neg_ids), max(1, n_negatives // 2))
+        n_random = n_negatives - n_hard
+
+        if len(hard_neg_ids) < n_hard or len(random_neg_ids) < n_random:
+            # Fall back to purely random if not enough hard negatives
+            if len(random_neg_ids) < n_negatives:
+                continue
+            rejected_ids = rng.sample(random_neg_ids, n_negatives)
+            neg_sources = ["random"] * n_negatives
+        else:
+            hard_sample = rng.sample(hard_neg_ids, n_hard)
+            rand_sample = rng.sample(random_neg_ids, n_random)
+            rejected_ids = hard_sample + rand_sample
+            neg_sources = ["also_view"] * n_hard + ["random"] * n_random
+
+        rejected = [
+            {**all_products[i], "neg_source": src}
+            for i, src in zip(rejected_ids, neg_sources)
+        ]
+
+        pairs.append({
+            "user_id":          sample["user_id"],
+            "query":            query,
+            "chosen":           chosen,
+            "rejected":         rejected,
+            "history_ids":      history_ids,
+            "copurchase_ids":   sample.get("copurchase_ids", []),
+            "split":            split,
+        })
+
+    return pairs
+
+
+# ---------------------------------------------------------------------------
+# Co-purchase graph export
+# ---------------------------------------------------------------------------
+
+def build_copurchase_graph(dataset: "AmazonDataset") -> Dict:
+    """
+    Export the co-purchase and co-view graphs as edge lists.
+
+    Returns
+    -------
+    {
+      "copurchase": {src_id: [dst_id, ...], ...},   # also_buy edges
+      "coview":     {src_id: [dst_id, ...], ...},   # also_view edges
+      "stats": {
+          "n_items": int,
+          "copurchase_edges": int,
+          "coview_edges": int,
+          "items_with_copurchase": int,
+      }
+    }
+
+    Usage
+    -----
+    The graph can be used for:
+      - Candidate expansion: when retrieving for user, include also_buy
+        neighbors of history items as additional candidates
+      - Graph embedding: train item embeddings that respect neighborhood
+      - Submodular diversity: penalise slates with many co-purchased items
+        (they are likely to be similar / redundant)
+    """
+    copurchase_edges = sum(len(v) for v in dataset.copurchase_map.values())
+    coview_edges = sum(len(v) for v in dataset.coview_map.values())
+    return {
+        "copurchase": dataset.copurchase_map,
+        "coview":     dataset.coview_map,
+        "stats": {
+            "n_items":               dataset.num_items,
+            "copurchase_edges":      copurchase_edges,
+            "coview_edges":          coview_edges,
+            "items_with_copurchase": len(dataset.copurchase_map),
+            "items_with_coview":     len(dataset.coview_map),
+        },
+    }
