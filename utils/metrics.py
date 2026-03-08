@@ -66,6 +66,21 @@ def coverage(
     return len(seen) / num_items
 
 
+def mrr_at_k(slate: List[int], target: int) -> float:
+    """Mean Reciprocal Rank: 1/rank if target is in the slate, else 0."""
+    if target not in slate:
+        return 0.0
+    return 1.0 / (slate.index(target) + 1)
+
+
+def intra_list_diversity(
+    slate: List[int],
+    embeddings: torch.Tensor,  # (num_items, embed_dim)
+) -> float:
+    """ILD = mean pairwise cosine distance in the slate (alias of diversity_score)."""
+    return diversity_score(slate, embeddings)
+
+
 # ---------------------------------------------------------------------------
 # Batch evaluation helper
 # ---------------------------------------------------------------------------
@@ -76,22 +91,26 @@ class SlateMetrics:
     def __init__(self):
         self.hits: List[float] = []
         self.ndcgs: List[float] = []
+        self.mrrs: List[float] = []
         self.all_slates: List[List[int]] = []
 
     def update(self, slate: List[int], target: int) -> None:
         self.hits.append(hit_at_k(slate, target))
         self.ndcgs.append(ndcg_at_k(slate, target))
+        self.mrrs.append(mrr_at_k(slate, target))
         self.all_slates.append(slate)
 
     def compute(self, num_items: int) -> dict:
         return {
-            "hit@k": float(np.mean(self.hits)) if self.hits else 0.0,
-            "ndcg@k": float(np.mean(self.ndcgs)) if self.ndcgs else 0.0,
-            "coverage": coverage(self.all_slates, num_items),
+            "hit@k":     float(np.mean(self.hits))  if self.hits  else 0.0,
+            "ndcg@k":    float(np.mean(self.ndcgs)) if self.ndcgs else 0.0,
+            "mrr@k":     float(np.mean(self.mrrs))  if self.mrrs  else 0.0,
+            "coverage":  coverage(self.all_slates, num_items),
             "n_samples": len(self.hits),
         }
 
     def reset(self) -> None:
         self.hits.clear()
         self.ndcgs.clear()
+        self.mrrs.clear()
         self.all_slates.clear()

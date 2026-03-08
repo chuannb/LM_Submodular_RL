@@ -22,6 +22,7 @@ class DataConfig:
     rr_events_path: Optional[str] = None
     rr_category_tree_path: Optional[str] = None
     rr_item_props_path: Optional[str] = None
+    rr_item_props_path2: Optional[str] = None
 
 
 @dataclass

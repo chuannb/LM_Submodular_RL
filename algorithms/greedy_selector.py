@@ -24,7 +24,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from models.submodular import SubmodularUtility
+from models.submodular import SubmodularUtility, RerankerBackedSubmodular
 
 
 def eps_from_kappa(kappa: float) -> float:
@@ -95,6 +95,79 @@ def budgeted_submodular_greedy(
         spent += costs.get(i_star, 1.0)
 
     final_score = utility.evaluate(slate, context, alpha_override)
+    return slate, final_score
+
+
+# ---------------------------------------------------------------------------
+# Greedy variant for RerankerBackedSubmodular (unified pipeline)
+# ---------------------------------------------------------------------------
+
+def budgeted_submodular_greedy_reranker(
+    candidates: List[int],                   # C: candidate item ids (catalogue indices)
+    reranker_score_map: Dict[int, float],     # precomputed p(yes) per item
+    utility: RerankerBackedSubmodular,        # f_θ (diversity params)
+    slate_size: int,
+    budget: float,
+    costs: Optional[Dict[int, float]] = None,
+    alpha_override: Optional[float] = None,
+    kappa: float = 0.0,
+) -> Tuple[List[int], float]:
+    """
+    BudgetedSubmodularGreedy for the unified pipeline.
+
+    Uses Qwen3-Reranker scores as relevance (precomputed externally).
+    Diversity comes from learnable item embeddings in RerankerBackedSubmodular.
+
+    Returns
+    -------
+    slate       : list of selected item ids (catalogue indices)
+    final_score : f_θ(slate | q, x)
+    """
+    if costs is None:
+        costs = {i: 1.0 for i in candidates}
+
+    slate: List[int] = []
+    slate_scores: List[float] = []
+    spent: float = 0.0
+    eps = eps_from_kappa(kappa)
+    tau = tau_from_kappa(kappa)
+
+    for _ in range(slate_size):
+        feasible = [
+            i for i in candidates
+            if i not in slate and spent + costs.get(i, 1.0) <= budget
+        ]
+        if not feasible:
+            break
+
+        gains = {
+            i: utility.marginal_gain_with_scores(
+                slate_ids=slate,
+                slate_rel_scores=slate_scores,
+                new_item=i,
+                new_item_rel=reranker_score_map.get(i, 0.0),
+                alpha_override=alpha_override,
+            )
+            for i in feasible
+        }
+        ratios = {i: (gains[i] / max(costs.get(i, 1.0), 1e-8)) for i in feasible}
+
+        if random.random() < eps:
+            items = list(ratios.keys())
+            q_vals = np.array([ratios[i] for i in items], dtype=np.float32)
+            q_vals = q_vals / tau
+            q_vals -= q_vals.max()
+            probs = np.exp(q_vals)
+            probs /= probs.sum()
+            i_star = int(np.random.choice(items, p=probs))
+        else:
+            i_star = max(ratios, key=ratios.__getitem__)
+
+        slate.append(i_star)
+        slate_scores.append(reranker_score_map.get(i_star, 0.0))
+        spent += costs.get(i_star, 1.0)
+
+    final_score = utility.evaluate_with_scores(slate, slate_scores, alpha_override)
     return slate, final_score
 
 
