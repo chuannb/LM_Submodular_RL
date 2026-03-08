@@ -1,7 +1,6 @@
 # Báo cáo: LM Submodular RL — Hệ thống Gợi ý Sản phẩm
 
 **Source code:** https://github.com/chuannb/LM_Submodular_RL
-**Ngày thực nghiệm:** 08/03/2026
 **Phần cứng:** NVIDIA GeForce RTX 3090 (24 GB VRAM)
 
 ---
