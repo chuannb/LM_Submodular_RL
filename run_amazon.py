@@ -487,6 +487,7 @@ def main(args: argparse.Namespace) -> None:
         buffer_size=args.buffer_size,
         min_buffer=args.min_buffer,
         gamma=args.gamma,
+        history_length=args.history_length,
         device=device,
     )
 

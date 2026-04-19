@@ -154,15 +154,30 @@ def proxy_reward_amazon(
     slate: List[int],
     target: int,
     stars: Optional[float] = None,
+    cand_idx: Optional[List[int]] = None,
+    cand_scores: Optional[List[float]] = None,
 ) -> float:
     """
-    Amazon: hit@k weighted by stars.
-    r = (stars / 5.0) if target in slate else 0.0
+    Shaped reward để giải quyết sparse reward problem (99% transitions r=0).
+
+    - Hit tại rank r : stars/5 * 1/log2(r+2)   (NDCG-style, max 1.0 tại rank 0)
+    - Trong candidates nhưng không vào slate : 0.1 * stars/5 * score_candidate
+    - Không có trong candidates : 0.0
     """
-    if target not in slate:
-        return 0.0
-    weight = (stars / 5.0) if stars is not None else 1.0
-    return float(weight)
+    stars_weight = (stars / 5.0) if stars is not None else 1.0
+
+    if target in slate:
+        rank = slate.index(target)
+        rank_bonus = 1.0 / np.log2(rank + 2)
+        return float(stars_weight * rank_bonus)
+
+    # Partial credit nếu target được retrieve nhưng greedy không chọn
+    if cand_idx is not None and target in cand_idx:
+        pos = cand_idx.index(target)
+        cand_score = cand_scores[pos] if cand_scores is not None else 0.5
+        return float(0.1 * stars_weight * cand_score)
+
+    return 0.0
 
 
 def proxy_reward_retailrocket(

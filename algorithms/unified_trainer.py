@@ -44,6 +44,7 @@ import torch.nn.functional as F
 
 from models.submodular import RerankerBackedSubmodular
 from retrieval.unified_pipeline import UnifiedPipeline, UnifiedRLPolicy
+from utils.encoders import encode_history
 from utils.metrics import SlateMetrics
 
 
@@ -122,6 +123,7 @@ class UnifiedJointTrainer:
         buffer_size: int = 20_000,
         min_buffer: int = 128,
         gamma: float = 0.99,
+        history_length: int = 10,
         device: torch.device = torch.device("cpu"),
     ):
         self.pipeline = pipeline
@@ -133,6 +135,7 @@ class UnifiedJointTrainer:
         self.batch_size = batch_size
         self.min_buffer = min_buffer
         self.gamma = gamma
+        self.history_length = history_length
         self.device = device
 
         self.replay = UnifiedReplayBuffer(max_size=buffer_size)
@@ -294,15 +297,6 @@ class UnifiedJointTrainer:
         for i, step in enumerate(trajectory_steps[:steps_per_epoch]):
             query = pipeline_query_fn(step)
 
-            # Proxy reward
-            if dataset_type == "amazon":
-                stars = step.history_extras[-1] if step.history_extras else None
-                reward_fn = lambda slate: proxy_reward_amazon(slate, step.item_id, stars)
-            else:
-                reward_fn = lambda slate: proxy_reward_retailrocket(
-                    slate, step.item_id, step.event
-                )
-
             trans_dict = self.pipeline.collect_transition(
                 query=query,
                 history_ids=step.history_ids,
@@ -316,10 +310,33 @@ class UnifiedJointTrainer:
             if trans_dict is None:
                 continue
 
-            reward = reward_fn(trans_dict["slate"])
+            # Shaped reward với candidate info (fix sparse reward)
+            if dataset_type == "amazon":
+                stars = step.history_extras[-1] if step.history_extras else None
+                reward = proxy_reward_amazon(
+                    slate=trans_dict["slate"],
+                    target=step.item_id,
+                    stars=stars,
+                    cand_idx=trans_dict["slate_cands_idx"],
+                    cand_scores=trans_dict["slate_cands_scores"],
+                )
+            else:
+                stars = None
+                reward = proxy_reward_retailrocket(
+                    trans_dict["slate"], step.item_id, step.event
+                )
             trans_dict["reward"] = reward
 
-            # Build next state (shift by 1: use current state as next_state proxy)
+            # Fix next_state: encode history thực của bước tiếp theo
+            # s_{t+1} = encode(history + [target_item]) — phản ánh đúng state sau interaction
+            next_hist_ids = (step.history_ids + [step.item_id])[-self.history_length:]
+            next_hist_ext = ((step.history_extras or []) + [stars if stars is not None else 5.0])[-self.history_length:]
+            next_state_t = encode_history(
+                [next_hist_ids], [next_hist_ext],
+                self.encoder, self.history_length, self.device,
+            )
+            next_state = next_state_t.cpu().numpy()[0]
+
             t = UnifiedTransition(
                 state=trans_dict["state"],
                 action=trans_dict["action"],
@@ -329,7 +346,7 @@ class UnifiedJointTrainer:
                 all_cand_scores=trans_dict["slate_cands_scores"],
                 target_idx=trans_dict["target"],
                 reward=reward,
-                next_state=trans_dict["state"],   # approximation
+                next_state=next_state,
                 done=False,
             )
 
