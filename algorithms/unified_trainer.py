@@ -283,6 +283,12 @@ class UnifiedJointTrainer:
             2. compute reward
             3. push to buffer + update
         """
+        import time
+        try:
+            from tqdm import tqdm
+        except ImportError:
+            tqdm = None
+
         from algorithms.trajectory_builder import (
             proxy_reward_amazon,
             proxy_reward_retailrocket,
@@ -291,55 +297,120 @@ class UnifiedJointTrainer:
         epoch_losses: Dict[str, List[float]] = {}
         random.shuffle(trajectory_steps)
 
-        for i, step in enumerate(trajectory_steps[:steps_per_epoch]):
+        # Timing accumulators (ms)
+        t_bm25 = t_reward = t_next_state = t_update = 0.0
+        n_hit = 0
+
+        steps = trajectory_steps[:steps_per_epoch]
+        iterator = tqdm(enumerate(steps), total=len(steps),
+                        desc="  train", unit="step", dynamic_ncols=True) \
+                   if tqdm else enumerate(steps)
+
+        for i, step in iterator:
             query = pipeline_query_fn(step)
 
-            # Proxy reward
-            if dataset_type == "amazon":
-                stars = step.history_extras[-1] if step.history_extras else None
-                reward_fn = lambda slate: proxy_reward_amazon(slate, step.item_id, stars)
-            else:
-                reward_fn = lambda slate: proxy_reward_retailrocket(
-                    slate, step.item_id, step.event
-                )
-
+            # ── BM25 + greedy selection ──────────────────────────────────
+            _t = time.perf_counter()
             trans_dict = self.pipeline.collect_transition(
                 query=query,
                 history_ids=step.history_ids,
                 history_extras=step.history_extras,
                 budget=step.budget,
                 target_item_idx=step.item_id,
-                reward=0.0,   # placeholder
+                reward=0.0,
                 dataset_type=dataset_type,
                 fast_mode=fast_mode,
+                inject_target=True,
             )
+            t_bm25 += (time.perf_counter() - _t) * 1000
+
             if trans_dict is None:
                 continue
 
-            reward = reward_fn(trans_dict["slate"])
-            trans_dict["reward"] = reward
+            slate = trans_dict["slate"]
 
-            # Build next state (shift by 1: use current state as next_state proxy)
+            # ── Reward ───────────────────────────────────────────────────
+            _t = time.perf_counter()
+            if step.reward is not None:
+                reward = float(step.reward) if step.item_id in slate else 0.0
+            elif dataset_type == "amazon":
+                stars = step.history_extras[-1] if step.history_extras else None
+                reward = proxy_reward_amazon(slate, step.item_id,
+                                             stars * 5 if stars is not None else None)
+            else:
+                reward = proxy_reward_retailrocket(slate, step.item_id, step.event)
+            t_reward += (time.perf_counter() - _t) * 1000
+            if reward > 0:
+                n_hit += 1
+
+            # ── Next state ───────────────────────────────────────────────
+            _t = time.perf_counter()
+            next_hist = (step.history_ids + [step.item_id])[-self.pipeline.history_length:]
+            next_ext  = None
+            if step.history_extras is not None:
+                target_star = float(step.reward) if step.reward is not None else 0.6
+                next_ext = (step.history_extras + [target_star])[-self.pipeline.history_length:]
+            next_state = self.pipeline.encode_state(next_hist, next_ext)
+            t_next_state += (time.perf_counter() - _t) * 1000
+
             t = UnifiedTransition(
                 state=trans_dict["state"],
                 action=trans_dict["action"],
-                slate=trans_dict["slate"],
+                slate=slate,
                 slate_rel_scores=trans_dict["rel_scores"],
                 all_cand_idx=trans_dict["slate_cands_idx"],
                 all_cand_scores=trans_dict["slate_cands_scores"],
                 target_idx=trans_dict["target"],
                 reward=reward,
-                next_state=trans_dict["state"],   # approximation
+                next_state=next_state,
                 done=False,
             )
 
+            # ── RL + submodular update ───────────────────────────────────
+            _t = time.perf_counter()
             losses = self.step([t])
+            t_update += (time.perf_counter() - _t) * 1000
+
             for k, v in losses.items():
                 epoch_losses.setdefault(k, []).append(v)
 
-            if log_every and i % log_every == 0 and losses:
-                loss_str = "  ".join(f"{k}={v:.4f}" for k, v in losses.items())
-                print(f"  step {i:4d} | {loss_str}")
+            # tqdm postfix — always show timing (even during warmup with no losses)
+            if tqdm and i % 5 == 0:
+                n = i + 1
+                postfix = {
+                    "bm25": f"{t_bm25/n:.0f}ms",
+                    "upd":  f"{t_update/n:.0f}ms",
+                    "hit":  f"{n_hit/n:.2%}",
+                }
+                if losses:
+                    postfix.update({k: f"{v:.4f}" for k, v in list(losses.items())[:2]})
+                iterator.set_postfix(postfix)
+
+            # fallback log when no tqdm
+            if not tqdm and log_every and (i + 1) % log_every == 0:
+                n = i + 1
+                loss_str = "  ".join(f"{k}={v:.4f}" for k, v in losses.items()) if losses else "(warmup)"
+                print(
+                    f"  step {n:4d}/{len(steps)}"
+                    f"  bm25={t_bm25/n:.0f}ms"
+                    f"  next_s={t_next_state/n:.0f}ms"
+                    f"  update={t_update/n:.0f}ms"
+                    f"  hit={n_hit/n:.2%}"
+                    f"  {loss_str}",
+                    flush=True,
+                )
+
+        # epoch summary
+        n = len(steps)
+        print(
+            f"\n  [timing/step]"
+            f"  bm25+greedy={t_bm25/n:.1f}ms"
+            f"  next_state={t_next_state/n:.1f}ms"
+            f"  rl_update={t_update/n:.1f}ms"
+            f"  total={( t_bm25+t_reward+t_next_state+t_update)/n:.1f}ms"
+            f"  hit_rate={n_hit/n:.3%}",
+            flush=True,
+        )
 
         return {k: float(np.mean(v)) for k, v in epoch_losses.items()}
 
@@ -352,13 +423,17 @@ class UnifiedJointTrainer:
         dataset_type: str = "amazon",
     ) -> Dict[str, float]:
         """Evaluate hit@k, NDCG@k, coverage on eval split."""
-        from algorithms.trajectory_builder import (
-            proxy_reward_amazon,
-            proxy_reward_retailrocket,
-        )
+        try:
+            from tqdm import tqdm as _tqdm
+        except ImportError:
+            _tqdm = None
 
         self.metrics.reset()
-        for step in eval_steps:
+        iterator = (
+            _tqdm(eval_steps, desc="  eval", unit="step", dynamic_ncols=True)
+            if _tqdm else eval_steps
+        )
+        for step in iterator:
             query = pipeline_query_fn(step)
             results, _ = self.pipeline.search(
                 query=query,

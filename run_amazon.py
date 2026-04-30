@@ -204,78 +204,83 @@ def main(args: argparse.Namespace) -> None:
     os.makedirs(args.output_dir, exist_ok=True)
 
     # -----------------------------------------------------------------------
-    # 1. Load data (shared across splits to avoid triple disk read)
+    # 1. Load data
     # -----------------------------------------------------------------------
     print(f"\n{'='*60}")
     print("Step 1: Loading Amazon data")
     print(f"{'='*60}")
 
-    from data.amazon_loader import (
-        load_amazon_metadata,
-        load_amazon_reviews,
-        load_amazon_reviews_for_items,
-        build_meta_from_reviews,
-        AmazonDataset,
-    )
+    use_v2 = bool(args.dataset_dir)
 
-    # Reviews-first approach:
-    #   1. Stream reviews to collect max_users qualifying users + their ASINs
-    #   2. Try to load matching metadata (fast targeted scan of meta file)
-    #   3. Fall back to building minimal product catalog from review data
-    print(f"  Streaming reviews (max_users={args.max_users}, min_interactions=5)...")
-    reviews_df = load_amazon_reviews(
-        args.review_path,
-        max_users=args.max_users,
-        min_interactions=5,
-    )
-    if reviews_df.empty:
-        print("ERROR: No reviews found. Check the review file path.")
-        return
-    print(f"  Reviews loaded: {len(reviews_df):,} rows, "
-          f"{reviews_df['reviewerID'].nunique():,} users, "
-          f"{reviews_df['asin'].nunique():,} unique ASINs")
-
-    keep_asins = set(reviews_df["asin"].unique())
-    meta_df = None
-    if args.meta_path:
-        print(f"  Loading metadata for {len(keep_asins):,} review ASINs "
-              f"(scanning up to {args.max_items:,} meta records)...")
-        meta_df = load_amazon_metadata(
-            args.meta_path,
-            keep_asins=keep_asins,
-            max_records=args.max_items,
+    if use_v2:
+        # ── V2 path: pre-split dataset ──────────────────────────────────
+        print(f"  [V2] dataset_dir={args.dataset_dir}")
+        print(f"  [V2] meta_path  ={args.meta_v2_path}")
+        from data.amazon_v2_loader import load_v2_dataset
+        v2 = load_v2_dataset(
+            dataset_dir=args.dataset_dir,
+            meta_path=args.meta_v2_path,
+            max_train_samples=args.max_train_samples,
         )
+        num_items  = v2["num_items"]
+        num_users  = v2["num_users"]
+        products   = v2["products"]
+        # id_map keys must match BM25 doc IDs, which are str(p["item_id"]) integers.
+        # Using str(asin) here caused every BM25 lookup to return -1 (zero overlap).
+        id_map     = {str(p["item_id"]): p["item_id"] for p in products}
+        title_map  = v2["title_map"]
+        price_map  = v2["price_map"]
+        copurchase_map = v2["copurchase_map"]
+        print(f"  Users: {num_users:,}  Items: {num_items:,}")
+        print(f"  Train: {len(v2['train']):,}  Val: {len(v2['val']):,}  Test: {len(v2['test']):,}")
+    else:
+        # ── Legacy path: raw review + meta files ────────────────────────
+        from data.amazon_loader import (
+            load_amazon_metadata,
+            load_amazon_reviews,
+            build_meta_from_reviews,
+            AmazonDataset,
+        )
+        print(f"  Streaming reviews (max_users={args.max_users}, min_interactions=5)...")
+        reviews_df = load_amazon_reviews(
+            args.review_path,
+            max_users=args.max_users,
+            min_interactions=5,
+        )
+        if reviews_df.empty:
+            print("ERROR: No reviews found. Check the review file path.")
+            return
+        print(f"  Reviews: {len(reviews_df):,} rows, "
+              f"{reviews_df['reviewerID'].nunique():,} users, "
+              f"{reviews_df['asin'].nunique():,} ASINs")
 
-    if meta_df is None or meta_df.empty:
-        print("  No matching metadata found — building product catalog from review summaries.")
-        meta_df = build_meta_from_reviews(reviews_df)
-    print(f"  Metadata loaded: {len(meta_df):,} products")
+        keep_asins = set(reviews_df["asin"].unique())
+        meta_df = None
+        if args.meta_path:
+            meta_df = load_amazon_metadata(
+                args.meta_path,
+                keep_asins=keep_asins,
+                max_records=args.max_items,
+            )
+        if meta_df is None or meta_df.empty:
+            meta_df = build_meta_from_reviews(reviews_df)
+        print(f"  Metadata: {len(meta_df):,} products")
 
-    # Shared-data datasets (no duplicate disk reads)
-    print("  Building train / val / test splits (8:1:1)...")
-    train_ds = AmazonDataset(
-        history_length=args.history_length,
-        split="train",
-        preloaded_reviews=reviews_df,
-        preloaded_meta=meta_df,
-    )
-    val_ds = AmazonDataset(
-        history_length=args.history_length,
-        split="val",
-        preloaded_reviews=reviews_df,
-        preloaded_meta=meta_df,
-    )
-    test_ds = AmazonDataset(
-        history_length=args.history_length,
-        split="test",
-        preloaded_reviews=reviews_df,
-        preloaded_meta=meta_df,
-    )
-
-    num_items = train_ds.num_items
-    num_users = train_ds.num_users
-    print(f"  Users: {num_users:,}  Items: {num_items:,}")
-    print(f"  Train: {len(train_ds):,}  Val: {len(val_ds):,}  Test: {len(test_ds):,}")
+        train_ds = AmazonDataset(history_length=args.history_length, split="train",
+                                 preloaded_reviews=reviews_df, preloaded_meta=meta_df)
+        val_ds   = AmazonDataset(history_length=args.history_length, split="val",
+                                 preloaded_reviews=reviews_df, preloaded_meta=meta_df)
+        test_ds  = AmazonDataset(history_length=args.history_length, split="test",
+                                 preloaded_reviews=reviews_df, preloaded_meta=meta_df)
+        num_items  = train_ds.num_items
+        num_users  = train_ds.num_users
+        title_map  = train_ds.title_map
+        price_map  = train_ds.price_map
+        copurchase_map = {}
+        products   = train_ds.to_products_list()
+        id_map     = dict(train_ds.item2id)
+        print(f"  Users: {num_users:,}  Items: {num_items:,}")
+        print(f"  Train: {len(train_ds):,}  Val: {len(val_ds):,}  Test: {len(test_ds):,}")
 
     # -----------------------------------------------------------------------
     # 2. Build product catalog
@@ -284,12 +289,9 @@ def main(args: argparse.Namespace) -> None:
     print("Step 2: Building product catalog")
     print(f"{'='*60}")
 
-    products = train_ds.to_products_list()
     products_path = os.path.join(args.output_dir, "products.jsonl")
     export_products_jsonl(products, products_path)
 
-    # id_map: asin (str) -> int index (same as train_ds.item2id)
-    id_map: Dict[str, int] = dict(train_ds.item2id)
     id_map_path = os.path.join(args.output_dir, "id_map.json")
     with open(id_map_path, "w") as f:
         json.dump(id_map, f)
@@ -303,10 +305,14 @@ def main(args: argparse.Namespace) -> None:
     print(f"{'='*60}")
 
     from retrieval.bm25_retriever import BM25Retriever
-    bm25 = BM25Retriever.build(products, backend="rank_bm25")
     bm25_path = os.path.join(args.output_dir, "bm25_index.pkl")
-    bm25.save(bm25_path)
-    print(f"  BM25 index saved -> {bm25_path}")
+    if os.path.exists(bm25_path) and not args.rebuild_bm25:
+        print(f"  Loading cached BM25 index <- {bm25_path}")
+        bm25 = BM25Retriever.load(bm25_path)
+    else:
+        bm25 = BM25Retriever.build(products, backend=args.bm25_backend)
+        bm25.save(bm25_path)
+        print(f"  BM25 index ({args.bm25_backend}) saved -> {bm25_path}")
 
     # -----------------------------------------------------------------------
     # 4. (Optional) Build dense index with Qwen3-Embedding-0.6B
@@ -367,7 +373,7 @@ def main(args: argparse.Namespace) -> None:
     ).to(device)
 
     costs_map: Dict[int, float] = {
-        idx: float(train_ds.price_map.get(idx, 1.0))
+        idx: float(price_map.get(idx, 1.0))
         for idx in range(num_items)
     }
 
@@ -402,14 +408,24 @@ def main(args: argparse.Namespace) -> None:
     print("Step 7: Building trajectories")
     print(f"{'='*60}")
 
-    from algorithms.trajectory_builder import build_trajectories
+    from algorithms.trajectory_builder import build_trajectories, build_trajectories_v2
 
-    train_steps = build_trajectories(train_ds, "train")
-    val_steps   = build_trajectories(val_ds,   "val")
-    test_steps  = build_trajectories(test_ds,  "test")
+    if use_v2:
+        train_steps = build_trajectories_v2(v2["train"], v2["item2id"], price_map,
+                                            history_length=args.history_length,
+                                            slate_size=args.slate_size)
+        val_steps   = build_trajectories_v2(v2["val"],   v2["item2id"], price_map,
+                                            history_length=args.history_length,
+                                            slate_size=args.slate_size)
+        test_steps  = build_trajectories_v2(v2["test"],  v2["item2id"], price_map,
+                                            history_length=args.history_length,
+                                            slate_size=args.slate_size)
+    else:
+        train_steps = build_trajectories(train_ds, "train")
+        val_steps   = build_trajectories(val_ds,   "val")
+        test_steps  = build_trajectories(test_ds,  "test")
     print(f"  Train: {len(train_steps):,}  Val: {len(val_steps):,}  Test: {len(test_steps):,}")
 
-    title_map = train_ds.title_map
     make_query = make_query_fn(title_map)
 
     # -----------------------------------------------------------------------
@@ -426,44 +442,48 @@ def main(args: argparse.Namespace) -> None:
     )
 
     # -----------------------------------------------------------------------
-    # 7b-2. Log co-purchase graph stats
+    # 7b-2. Co-purchase graph stats
     # -----------------------------------------------------------------------
-    from data.amazon_loader import build_copurchase_graph
-    graph = build_copurchase_graph(train_ds)
-    gs = graph["stats"]
-    print(f"\n  Co-purchase graph (also_buy):")
-    print(f"    Items with neighbors : {gs['items_with_copurchase']:,} / {gs['n_items']:,}")
-    print(f"    Total edges          : {gs['copurchase_edges']:,}")
-    print(f"  Co-view graph (also_view):")
-    print(f"    Items with neighbors : {gs['items_with_coview']:,} / {gs['n_items']:,}")
-    print(f"    Total edges          : {gs['coview_edges']:,}")
-
-    # -----------------------------------------------------------------------
-    # 7c. Build and save DPO pairs (for reranker / DPO fine-tuning)
-    # -----------------------------------------------------------------------
-    print(f"\n{'='*60}")
-    print("Step 7c: Building DPO preference pairs")
-    print(f"{'='*60}")
-
-    dpo_dir = os.path.join(args.output_dir, "dpo_pairs")
-    dpo_files = {s: os.path.join(dpo_dir, f"{s}.jsonl") for s in ("train", "val", "test")}
-    dpo_exists = all(os.path.exists(p) for p in dpo_files.values())
-
-    if dpo_exists:
-        print(f"  DPO pairs already exist — skipping generation.")
-        for split_name, path in dpo_files.items():
-            n = sum(1 for _ in open(path, encoding="utf-8"))
-            print(f"  {split_name:5s}: {n:,} pairs (cached) <- {path}")
+    if use_v2:
+        n_with_cp = len(copurchase_map)
+        total_edges = sum(len(v) for v in copurchase_map.values())
+        print(f"\n  Co-purchase graph (also_buy):")
+        print(f"    Items with neighbors : {n_with_cp:,} / {num_items:,}")
+        print(f"    Total edges          : {total_edges:,}")
     else:
-        from data.amazon_loader import build_dpo_pairs
-        os.makedirs(dpo_dir, exist_ok=True)
-        for split_name, ds in [("train", train_ds), ("val", val_ds), ("test", test_ds)]:
-            pairs = build_dpo_pairs(ds, split=split_name, n_negatives=4, seed=args.seed)
-            out_path = dpo_files[split_name]
-            with open(out_path, "w", encoding="utf-8") as f:
-                for pair in pairs:
-                    f.write(json.dumps(pair, ensure_ascii=False) + "\n")
-            print(f"  {split_name:5s}: {len(pairs):,} pairs -> {out_path}")
+        from data.amazon_loader import build_copurchase_graph
+        graph = build_copurchase_graph(train_ds)
+        gs = graph["stats"]
+        print(f"\n  Co-purchase graph (also_buy):")
+        print(f"    Items with neighbors : {gs['items_with_copurchase']:,} / {gs['n_items']:,}")
+        print(f"    Total edges          : {gs['copurchase_edges']:,}")
+
+    # -----------------------------------------------------------------------
+    # 7c. DPO pairs (legacy only — V2 uses pre-built pairs separately)
+    # -----------------------------------------------------------------------
+    if not use_v2:
+        print(f"\n{'='*60}")
+        print("Step 7c: Building DPO preference pairs")
+        print(f"{'='*60}")
+
+        dpo_dir = os.path.join(args.output_dir, "dpo_pairs")
+        dpo_files = {s: os.path.join(dpo_dir, f"{s}.jsonl") for s in ("train", "val", "test")}
+        dpo_exists = all(os.path.exists(p) for p in dpo_files.values())
+
+        if dpo_exists:
+            print(f"  DPO pairs already exist — skipping generation.")
+        else:
+            from data.amazon_loader import build_dpo_pairs
+            os.makedirs(dpo_dir, exist_ok=True)
+            for split_name, ds in [("train", train_ds), ("val", val_ds), ("test", test_ds)]:
+                pairs = build_dpo_pairs(ds, split=split_name, n_negatives=4, seed=args.seed)
+                out_path = dpo_files[split_name]
+                with open(out_path, "w", encoding="utf-8") as f:
+                    for pair in pairs:
+                        f.write(json.dumps(pair, ensure_ascii=False) + "\n")
+                print(f"  {split_name:5s}: {len(pairs):,} pairs -> {out_path}")
+    else:
+        print("\nStep 7c: Skipping DPO pairs (V2 mode — use pre-built pairs separately)")
 
     # -----------------------------------------------------------------------
     # 8. Train (RL + submodular)
@@ -596,19 +616,30 @@ def parse_args() -> argparse.Namespace:
         description="Amazon Recommendation Pipeline: Embedding + Reranker + Submodular + RL"
     )
 
-    # Data
-    p.add_argument("--review_path",
-                   default="/workspace/All_Amazon_Review_5_10M_filtered.json",
-                   help="Path to review JSONL file")
-    p.add_argument("--meta_path",
-                   default="/workspace/All_Amazon_Meta_in_Review.json",
-                   help="Path to metadata JSONL file")
-    p.add_argument("--max_items",    type=int,   default=50_000,
-                   help="Load first N products from meta file (avoids scanning full 12GB)")
-    p.add_argument("--max_users",    type=int,   default=2000,
-                   help="Sample N users with >= 5 reviews for catalog products")
-    p.add_argument("--history_length", type=int, default=10,
+    # Data — V2 (pre-split, recommended)
+    p.add_argument("--dataset_dir",
+                   default="/workspace/amazon/dataset",
+                   help="Directory with train/val/test.jsonl (V2 pre-split dataset)")
+    p.add_argument("--meta_v2_path",
+                   default="/workspace/amazon/sampled_meta.jsonl",
+                   help="Path to sampled_meta.jsonl (V2)")
+    p.add_argument("--max_train_samples", type=int, default=None,
+                   help="Limit train samples (None = all 11.7M)")
+
+    # Data — legacy (raw review + meta files)
+    p.add_argument("--review_path",  default=None, help="Legacy: raw review JSONL")
+    p.add_argument("--meta_path",    default=None, help="Legacy: raw meta JSONL")
+    p.add_argument("--max_items",    type=int, default=50_000)
+    p.add_argument("--max_users",    type=int, default=2000)
+    p.add_argument("--history_length", type=int, default=20,
                    help="Number of past interactions to encode as state")
+
+    # BM25 backend
+    p.add_argument("--bm25_backend", default="bm25s",
+                   choices=["bm25s", "rank_bm25", "pyserini"],
+                   help="BM25 backend (bm25s recommended: ~1000x faster)")
+    p.add_argument("--rebuild_bm25", action="store_true",
+                   help="Force rebuild BM25 index even if cached")
 
     # Retrieval
     p.add_argument("--build_dense",  action="store_true",
@@ -617,7 +648,7 @@ def parse_args() -> argparse.Namespace:
                    help="BM25 recall size (candidates from BM25)")
     p.add_argument("--n_dense",      type=int, default=50,
                    help="Dense recall size (candidates from dense index)")
-    p.add_argument("--n_fuse",       type=int, default=30,
+    p.add_argument("--n_fuse",       type=int, default=200,
                    help="Candidates after RRF fusion, passed to reranker")
     p.add_argument("--embed_batch_size",    type=int, default=16)
     p.add_argument("--reranker_batch_size", type=int, default=8)
@@ -628,7 +659,7 @@ def parse_args() -> argparse.Namespace:
     # Training
     p.add_argument("--epochs",       type=int,   default=3)
     p.add_argument("--steps_per_epoch", type=int, default=200)
-    p.add_argument("--eval_steps",   type=int,   default=None,
+    p.add_argument("--eval_steps",   type=int,   default=500,
                    help="Max steps for val/test evaluation (None = all)")
     p.add_argument("--batch_size",   type=int,   default=32)
     p.add_argument("--buffer_size",  type=int,   default=10_000)

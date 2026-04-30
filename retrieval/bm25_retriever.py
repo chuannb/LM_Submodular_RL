@@ -99,6 +99,58 @@ class _RankBM25Backend:
 
 
 # ---------------------------------------------------------------------------
+# bm25s backend (fast numpy/sparse, recommended for large catalogs)
+# ---------------------------------------------------------------------------
+
+class _BM25SBackend:
+    """
+    bm25s backend: numpy/sparse implementation, ~1000x faster than rank_bm25.
+    Install: pip install bm25s
+    """
+
+    def __init__(self, products: List[Dict[str, Any]]):
+        try:
+            import bm25s
+        except ImportError as e:
+            raise ImportError("Install bm25s: pip install bm25s") from e
+
+        self.products = products
+        self.ids    = [str(p["item_id"]) for p in products]
+        self.titles = [str(p.get("title", "")) for p in products]
+        self.texts  = [_build_doc_text(p) for p in products]
+
+        corpus_tokens = bm25s.tokenize(self.texts, show_progress=False)
+        self.retriever = bm25s.BM25()
+        self.retriever.index(corpus_tokens, show_progress=False)
+
+    def search(self, query: str, top_k: int = 100) -> List[SearchResult]:
+        import bm25s
+        tokens = bm25s.tokenize([query], show_progress=False)
+        top_k  = min(top_k, len(self.products))
+        results_idx, scores = self.retriever.retrieve(tokens, k=top_k, show_progress=False)
+        out = []
+        for idx, score in zip(results_idx[0], scores[0]):
+            out.append(SearchResult(
+                item_id=self.ids[idx],
+                score=float(score),
+                title=self.titles[idx],
+                text=self.texts[idx],
+            ))
+        return out
+
+    def save(self, path: str) -> None:
+        import pickle
+        with open(path, "wb") as f:
+            pickle.dump(self, f)
+
+    @classmethod
+    def load(cls, path: str) -> "_BM25SBackend":
+        import pickle
+        with open(path, "rb") as f:
+            return pickle.load(f)
+
+
+# ---------------------------------------------------------------------------
 # Pyserini backend (production – requires Java 11+ and pyserini)
 # ---------------------------------------------------------------------------
 
@@ -201,6 +253,8 @@ class BM25Retriever:
             if pyserini_index_dir is None:
                 raise ValueError("pyserini_index_dir is required for pyserini backend")
             return cls(_PyseriniBackend(pyserini_index_dir))
+        elif backend == "bm25s":
+            return cls(_BM25SBackend(products))
         else:
             return cls(_RankBM25Backend(products))
 
@@ -210,16 +264,21 @@ class BM25Retriever:
 
     @classmethod
     def load(cls, path: str) -> "BM25Retriever":
-        """Load a previously saved rank_bm25 index."""
-        return cls(_RankBM25Backend.load(path))
+        """Load a previously saved index (auto-detects backend from pickle)."""
+        import pickle
+        with open(path, "rb") as f:
+            backend_obj = pickle.load(f)
+        if isinstance(backend_obj, BM25Retriever):
+            return backend_obj
+        return cls(backend_obj)
 
     # ------------------------------------------------------------------
     def search(self, query: str, top_k: int = 100) -> List[SearchResult]:
         return self._backend.search(query, top_k)
 
     def save(self, path: str) -> None:
-        """Persist rank_bm25 index to disk (not applicable for Pyserini)."""
-        if isinstance(self._backend, _RankBM25Backend):
+        """Persist rank_bm25 or bm25s index to disk (not applicable for Pyserini)."""
+        if isinstance(self._backend, (_RankBM25Backend, _BM25SBackend)):
             self._backend.save(path)
         else:
             raise NotImplementedError("Pyserini index is managed externally.")

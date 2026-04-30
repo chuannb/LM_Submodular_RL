@@ -113,62 +113,98 @@ def budgeted_submodular_greedy_reranker(
     kappa: float = 0.0,
 ) -> Tuple[List[int], float]:
     """
-    BudgetedSubmodularGreedy for the unified pipeline.
+    Vectorized BudgetedSubmodularGreedy for the unified pipeline.
 
-    Uses Qwen3-Reranker scores as relevance (precomputed externally).
-    Diversity comes from learnable item embeddings in RerankerBackedSubmodular.
+    Precomputes all pairwise kernel values once (one GPU op), then computes
+    marginal gains for the entire feasible set in batch each greedy step —
+    replacing O(slate_size × n_candidates) tensor allocations with O(slate_size)
+    numpy array ops.
 
     Returns
     -------
     slate       : list of selected item ids (catalogue indices)
     final_score : f_θ(slate | q, x)
     """
-    if costs is None:
-        costs = {i: 1.0 for i in candidates}
+    if not candidates:
+        return [], 0.0
 
-    slate: List[int] = []
-    slate_scores: List[float] = []
-    spent: float = 0.0
+    n = len(candidates)
+    device = utility.item_emb.weight.device
+    alpha = float(alpha_override) if alpha_override is not None else utility.alpha.item()
+
+    # ── One-time precomputation: embeddings + full pairwise kernel (n×n) ──
+    with torch.no_grad():
+        cand_t = torch.tensor(candidates, dtype=torch.long, device=device)
+        embs = F.normalize(utility.item_emb(cand_t), dim=-1)  # (n, d)
+        sim = embs @ embs.T                                    # (n, n)
+        if utility.kernel == "rbf":
+            bw = torch.exp(utility.log_bandwidth).clamp(min=1e-3)
+            k_mat = torch.exp(-(1.0 - sim) / bw)
+        else:
+            k_mat = (sim + 1.0) / 2.0
+    k_np = k_mat.cpu().numpy()  # (n, n) — kernel values for all candidate pairs
+
+    rel_arr  = np.array([reranker_score_map.get(c, 0.0) for c in candidates], dtype=np.float32)
+    cost_arr = np.array([(costs or {}).get(c, 1.0) for c in candidates], dtype=np.float32)
+
+    slate_local: List[int] = []   # local indices into candidates[]
+    in_slate = np.zeros(n, dtype=bool)
+    budget_rem = float(budget)
+    kernel_sum = 0.0   # Σ_{i≠j ∈ slate} k(e_i, e_j) (ordered pairs)
+    sum_rel    = 0.0   # Σ_{i ∈ slate} rel(i)
+    k_cur      = 0     # current slate size
+
     eps = eps_from_kappa(kappa)
     tau = tau_from_kappa(kappa)
 
     for _ in range(slate_size):
-        feasible = [
-            i for i in candidates
-            if i not in slate and spent + costs.get(i, 1.0) <= budget
-        ]
-        if not feasible:
+        feasible = np.where(~in_slate & (cost_arr <= budget_rem))[0]
+        if feasible.size == 0:
             break
 
-        gains = {
-            i: utility.marginal_gain_with_scores(
-                slate_ids=slate,
-                slate_rel_scores=slate_scores,
-                new_item=i,
-                new_item_rel=reranker_score_map.get(i, 0.0),
-                alpha_override=alpha_override,
-            )
-            for i in feasible
-        }
-        ratios = {i: (gains[i] / max(costs.get(i, 1.0), 1e-8)) for i in feasible}
-
-        if random.random() < eps:
-            items = list(ratios.keys())
-            q_vals = np.array([ratios[i] for i in items], dtype=np.float32)
-            q_vals = q_vals / tau
-            q_vals -= q_vals.max()
-            probs = np.exp(q_vals)
-            probs /= probs.sum()
-            i_star = int(np.random.choice(items, p=probs))
+        # ── Vectorized marginal gain for all feasible items ──────────────
+        if k_cur == 0:
+            # Single-item slate: diversity = 0, only relevance counts
+            benefit = alpha * rel_arr[feasible]
         else:
-            i_star = max(ratios, key=ratios.__getitem__)
+            # f(S) — same for all candidates, compute once
+            div_S = (1.0 - kernel_sum / (k_cur * (k_cur - 1))) if k_cur >= 2 else 0.0
+            f_S   = alpha * (sum_rel / k_cur) + (1.0 - alpha) * div_S
 
-        slate.append(i_star)
-        slate_scores.append(reranker_score_map.get(i_star, 0.0))
-        spent += costs.get(i_star, 1.0)
+            # For each feasible item i: Σ_{j∈slate} k(e_i, e_j)  → shape (|feasible|,)
+            sum_k = k_np[np.ix_(feasible, slate_local)].sum(axis=1)
 
-    final_score = utility.evaluate_with_scores(slate, slate_scores, alpha_override)
-    return slate, final_score
+            new_k   = k_cur + 1
+            rel_new = (sum_rel + rel_arr[feasible]) / new_k
+            div_new = 1.0 - (kernel_sum + 2.0 * sum_k) / (new_k * k_cur)
+            benefit = alpha * rel_new + (1.0 - alpha) * div_new - f_S
+
+        ratios = benefit / np.maximum(cost_arr[feasible], 1e-8)
+
+        # ── Selection (greedy or ε-exploration) ──────────────────────────
+        if random.random() < eps:
+            q = (ratios / tau).astype(np.float64)
+            q -= q.max()
+            probs = np.exp(q); probs /= probs.sum()
+            local_idx = int(np.random.choice(len(feasible), p=probs))
+        else:
+            local_idx = int(np.argmax(ratios))
+
+        chosen = int(feasible[local_idx])
+
+        # Update incremental state
+        if k_cur > 0:
+            kernel_sum += 2.0 * k_np[chosen, slate_local].sum()
+        sum_rel += rel_arr[chosen]
+        slate_local.append(chosen)
+        in_slate[chosen] = True
+        budget_rem -= cost_arr[chosen]
+        k_cur += 1
+
+    slate_ids    = [candidates[i] for i in slate_local]
+    slate_scores = [reranker_score_map.get(c, 0.0) for c in slate_ids]
+    final_score  = utility.evaluate_with_scores(slate_ids, slate_scores, alpha_override)
+    return slate_ids, final_score
 
 
 # ---------------------------------------------------------------------------

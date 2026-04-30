@@ -92,6 +92,60 @@ def build_trajectories_retailrocket(
     return steps
 
 
+def build_trajectories_v2(
+    samples: list,
+    item2id: dict,
+    price_map: dict,
+    history_length: int = 20,
+    slate_size: int = 10,
+) -> List[TrajectoryStep]:
+    """
+    Build trajectory steps from V2 pre-split dataset.
+
+    Each sample dict:
+      user_id, history:[{asin, stars, ts}], target_asin,
+      target_stars, r_hit (user-normalized reward), user_mean_stars, ts
+
+    r_hit is stored in step.reward for direct use during training.
+    Budget = mean_price * slate_size so greedy can always fill a full slate.
+    Falls back to slate_size when no price data is available.
+    """
+    steps: List[TrajectoryStep] = []
+    for rec in samples:
+        target_asin = rec.get("target_asin", "")
+        if not target_asin or target_asin not in item2id:
+            continue
+
+        target_id = item2id[target_asin]
+        history   = rec.get("history", [])
+
+        # Trim to history_length most recent
+        history = history[-history_length:]
+
+        history_ids   = [item2id[h["asin"]] for h in history if h.get("asin") in item2id]
+        history_stars = [float(h.get("stars", 3)) / 5.0 for h in history if h.get("asin") in item2id]
+
+        if not history_ids:
+            continue
+
+        # Budget = mean price * slate_size so full slate is affordable.
+        # Without this, budget=1.0 with uniform costs=1.0 limits slate to 1 item.
+        prices = [price_map.get(i, 0.0) for i in history_ids]
+        valid  = [p for p in prices if p > 0]
+        budget = float(np.mean(valid)) * slate_size if valid else float(slate_size)
+
+        steps.append(TrajectoryStep(
+            user_id       = rec.get("user_id", ""),
+            item_id       = target_id,
+            history_ids   = history_ids,
+            history_extras= history_stars,
+            budget        = budget,
+            split         = "train",   # caller sets correct split label
+            reward        = float(rec.get("r_hit", 0.5)),
+        ))
+    return steps
+
+
 def build_trajectories(
     dataset,
     split: str = "train",
