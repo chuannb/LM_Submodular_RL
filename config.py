@@ -15,9 +15,13 @@ class DataConfig:
     train_ratio: float = 0.8
     val_ratio: float = 0.1
     test_ratio: float = 0.1
-    # Amazon paths
+    # Amazon paths (legacy)
     amazon_review_path: Optional[str] = None
     amazon_meta_path: Optional[str] = None
+    # Amazon V2 paths (pre-split dataset)
+    amazon_dataset_dir: Optional[str] = None   # dir with train/val/test.jsonl
+    amazon_meta_v2_path: Optional[str] = None  # sampled_meta.jsonl
+    amazon_max_train_samples: Optional[int] = None  # None = use all
     # RetailRocket paths
     rr_events_path: Optional[str] = None
     rr_category_tree_path: Optional[str] = None
