@@ -25,6 +25,9 @@ Usage:
 
   # Skip preprocessing cache (reuse from previous run)
   python -m retrieval_models.sasrec.train --skip_preprocess
+
+  # Resume from checkpoint (e.g. 50 more epochs from epoch 5)
+  python -m retrieval_models.sasrec.train --resume --skip_preprocess --epochs 55 --batch_size 65536 --lr 0.008 --no_upload
 """
 
 import argparse
@@ -123,11 +126,10 @@ def preprocess_jsonl(jsonl_path, asin2iid, maxlen, cache_dir, split_name):
 # ===========================================================================
 
 class SequenceDataset(Dataset):
-    def __init__(self, seqs, targets, item_num, num_neg=1):
+    def __init__(self, seqs, targets, item_num):
         self.seqs     = seqs
         self.targets  = targets
         self.item_num = item_num
-        self.num_neg  = num_neg
 
     def __len__(self):
         return len(self.targets)
@@ -135,16 +137,25 @@ class SequenceDataset(Dataset):
     def __getitem__(self, idx):
         seq    = self.seqs[idx].astype(np.int64)
         target = int(self.targets[idx])
+
+        # Multi-position: pos[i] = next item after seq[i] (original SASRec scheme)
+        pos_seq      = np.empty_like(seq)
+        pos_seq[:-1] = seq[1:]   # shift left
+        pos_seq[-1]  = target    # last position → true next item
+
+        # One random negative per non-padding position
         hist_set = set(seq[seq != 0]) | {target}
-        negs = []
-        while len(negs) < self.num_neg:
+        neg_seq  = np.ones_like(seq)          # default=1, padding positions won't be used
+        for i in np.where(seq != 0)[0]:
             n = random.randint(1, self.item_num)
-            if n not in hist_set:
-                negs.append(n)
+            while n in hist_set:
+                n = random.randint(1, self.item_num)
+            neg_seq[i] = n
+
         return (
             torch.from_numpy(seq),
-            torch.tensor(target, dtype=torch.long),
-            torch.tensor(negs,   dtype=torch.long),
+            torch.from_numpy(pos_seq),
+            torch.from_numpy(neg_seq),
         )
 
 
@@ -152,30 +163,42 @@ class SequenceDataset(Dataset):
 # 4. Build FAISS index từ item embeddings sau training
 # ===========================================================================
 
-def build_faiss_index(model, item_num, device, batch_size=8192):
-    import faiss
+def build_item_embs(model, item_num, device, batch_size=8192):
+    """Build normalized item embeddings on GPU. Row i → item_id i+1."""
     model.eval()
-    all_embs = []
+    parts = []
     ids_full = torch.arange(1, item_num + 1, device=device)
     for start in tqdm(range(0, item_num, batch_size),
-                      desc="indexing items", unit="batch", dynamic_ncols=True):
+                      desc="building item embs", unit="batch", dynamic_ncols=True):
         chunk = ids_full[start: start + batch_size]
         with torch.no_grad():
             emb = nn.functional.normalize(model.item_emb(chunk), dim=-1)
-        all_embs.append(emb.cpu().numpy().astype(np.float32))
-    all_embs = np.vstack(all_embs)
-    index = faiss.IndexFlatIP(all_embs.shape[1])
-    index.add(all_embs)
-    print(f"  FAISS: {index.ntotal:,} vectors, dim={all_embs.shape[1]}", flush=True)
+        parts.append(emb)
+    item_embs = torch.cat(parts, dim=0)   # (item_num, d) on GPU
+    print(f"  item embs: {item_embs.shape}, {item_embs.element_size()*item_embs.numel()/1e6:.0f} MB on {device}",
+          flush=True)
+    return item_embs
+
+
+def build_faiss_index_cpu(item_embs_gpu):
+    """CPU FAISS index from GPU tensor — only for saving to disk."""
+    import faiss
+    arr = item_embs_gpu.cpu().numpy().astype(np.float32)
+    index = faiss.IndexFlatIP(arr.shape[1])
+    index.add(arr)
     return index
 
 
 # ===========================================================================
-# 5. Recall@K evaluation — so sánh với BM25 baseline
+# 5. Recall@K evaluation — GPU matmul, no FAISS dependency
 # ===========================================================================
 
-def evaluate_recall(model, faiss_idx, jsonl_path, asin2iid, maxlen,
+def evaluate_recall(model, item_embs, jsonl_path, asin2iid, maxlen,
                     topk_list, device, sample=5000, batch_size=256, seed=42):
+    """
+    item_embs: (item_num, d) normalized GPU tensor. Row i → item_id i+1.
+    Uses batched GPU matmul — much faster than CPU FAISS search.
+    """
     random.seed(seed)
     reservoir = []
     with open(jsonl_path) as f:
@@ -200,12 +223,13 @@ def evaluate_recall(model, faiss_idx, jsonl_path, asin2iid, maxlen,
             return
         seqs_t = torch.from_numpy(np.stack(seqs_buf)).to(device)
         with torch.no_grad():
-            uembs = model.user_embedding(seqs_t).cpu().numpy().astype(np.float32)
-        _, indices = faiss_idx.search(uembs, max_k)
-        for row, target in zip(indices, tgts_buf):
-            result_iids = row + 1    # FAISS row 0 → item_id 1
+            uembs   = model.user_embedding(seqs_t)          # (B, d) on GPU
+            scores  = torch.matmul(uembs, item_embs.T)      # (B, item_num)
+            _, topk = scores.topk(max_k, dim=1)             # (B, max_k) 0-indexed
+        topk_np = (topk + 1).cpu().numpy()                  # → item_id (1-indexed)
+        for row, target in zip(topk_np, tgts_buf):
             for k in topk_list:
-                if target in result_iids[:k]:
+                if target in row[:k]:
                     hits[k] += 1
             valid += 1
         seqs_buf.clear()
@@ -290,12 +314,14 @@ def parse_args():
     # Eval
     p.add_argument("--topk",        type=int, nargs="+", default=[10, 50, 100, 200])
     p.add_argument("--eval_sample", type=int, default=5000)
-    p.add_argument("--eval_batch",  type=int, default=256)
+    p.add_argument("--eval_batch",  type=int, default=512)
     # Misc
     p.add_argument("--device",  default="auto")
     p.add_argument("--hf_repo", default="chuannb/sasrec-amazon-retrieval")
     p.add_argument("--no_upload",       action="store_true")
     p.add_argument("--skip_preprocess", action="store_true")
+    p.add_argument("--resume",          action="store_true",
+                   help="Resume from last_checkpoint.pt for continued training")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -353,33 +379,47 @@ def main():
     n_params = sum(p.numel() for p in model.parameters())
     print(f"\nSASRec params={n_params:,}", flush=True)
 
-    dataset = SequenceDataset(train_seqs, train_targets, item_num, args.num_neg)
+    dataset = SequenceDataset(train_seqs, train_targets, item_num)
     loader  = DataLoader(dataset, batch_size=args.batch_size, shuffle=True,
                          num_workers=4, pin_memory=(device.type == "cuda"),
                          persistent_workers=True)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
-    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=2, gamma=0.5)
 
     # ── 4. Training ───────────────────────────────────────────────────────────
     print(f"\nTraining: {args.epochs} epochs × {len(dataset):,} records "
           f"(batch={args.batch_size})\n", flush=True)
 
-    best_r200  = 0.0
-    history    = []
+    start_epoch = 1
+    best_r200   = 0.0
+    history     = []
 
-    for epoch in range(1, args.epochs + 1):
+    if args.resume:
+        ckpt_path = out_dir / "last_checkpoint.pt"
+        if ckpt_path.exists():
+            ckpt = torch.load(ckpt_path, map_location=device)
+            model.load_state_dict(ckpt["model_state"])
+            optimizer.load_state_dict(ckpt["optimizer_state"])
+            start_epoch = ckpt["epoch"] + 1
+            best_r200   = ckpt["best_r200"]
+            history     = ckpt.get("history", [])
+            print(f"Resumed from epoch {ckpt['epoch']}, best_r200={best_r200:.4f}", flush=True)
+        else:
+            print("--resume: no last_checkpoint.pt found, starting fresh.", flush=True)
+
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         total_loss = 0.0
         t0 = time.perf_counter()
 
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}",
                     unit="batch", dynamic_ncols=True)
-        for seqs, pos_ids, neg_ids in pbar:
+        for seqs, pos_seq, neg_seq in pbar:
             seqs    = seqs.to(device)
-            pos_ids = pos_ids.to(device)
-            neg_ids = neg_ids.to(device)
-            pos_logits, neg_logits = model(seqs, pos_ids, neg_ids)
-            loss = model.bce_loss(pos_logits, neg_logits)
+            pos_seq = pos_seq.to(device)
+            neg_seq = neg_seq.to(device)
+            mask    = seqs != 0                                      # (B, L) valid positions
+            pos_logits, neg_logits = model(seqs, pos_seq, neg_seq)
+            loss = model.bce_loss(pos_logits, neg_logits, mask)
             optimizer.zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(model.parameters(), 5.0)
@@ -387,16 +427,16 @@ def main():
             total_loss += loss.item()
             pbar.set_postfix(loss=f"{loss.item():.4f}")
 
-        scheduler.step()
         avg_loss = total_loss / len(loader)
         print(f"\nEpoch {epoch}  loss={avg_loss:.4f}  {time.perf_counter()-t0:.0f}s", flush=True)
 
-        faiss_idx = build_faiss_index(model, item_num, device)
+        item_embs = build_item_embs(model, item_num, device)
         recall = evaluate_recall(
-            model, faiss_idx, args.test_path, asin2iid,
+            model, item_embs, args.test_path, asin2iid,
             args.maxlen, args.topk, device,
             sample=args.eval_sample, batch_size=args.eval_batch,
         )
+        del item_embs                                        # free GPU mem after eval
         r200 = recall.get(200, recall.get(max(args.topk), 0.0))
         history.append({"epoch": epoch, "loss": avg_loss, "recall": recall})
 
@@ -408,21 +448,31 @@ def main():
             }, out_dir / "best_model.pt")
             print(f"  ✓ best recall@{max(args.topk)}={r200:.4f} saved", flush=True)
 
+        torch.save({
+            "epoch": epoch,
+            "model_state": model.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "best_r200": best_r200,
+            "history": history,
+        }, out_dir / "last_checkpoint.pt")
+
     # ── 5. Final eval ─────────────────────────────────────────────────────────
     ckpt = torch.load(out_dir / "best_model.pt", map_location=device)
     model.load_state_dict(ckpt["model_state"])
     print(f"\nBest checkpoint: epoch {ckpt['epoch']}", flush=True)
 
-    faiss_idx    = build_faiss_index(model, item_num, device)
+    item_embs    = build_item_embs(model, item_num, device)
     final_recall = evaluate_recall(
-        model, faiss_idx, args.test_path, asin2iid,
+        model, item_embs, args.test_path, asin2iid,
         args.maxlen, args.topk, device,
         sample=args.eval_sample, batch_size=args.eval_batch,
     )
 
-    # Save FAISS index
+    # Save FAISS index (CPU only, for inference use)
     import faiss
-    faiss.write_index(faiss_idx, str(out_dir / "item_faiss.index"))
+    faiss_index = build_faiss_index_cpu(item_embs)
+    del item_embs
+    faiss.write_index(faiss_index, str(out_dir / "item_faiss.index"))
     print(f"FAISS saved ({(out_dir/'item_faiss.index').stat().st_size/1e6:.0f} MB)", flush=True)
 
     # Save results

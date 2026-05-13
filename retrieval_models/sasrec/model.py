@@ -136,28 +136,29 @@ class SASRec(nn.Module):
     def forward(
         self,
         seqs:    torch.Tensor,   # (B, L)
-        pos_ids: torch.Tensor,   # (B,)   positive item ids
-        neg_ids: torch.Tensor,   # (B, K) negative item ids
+        pos_ids: torch.Tensor,   # (B, L) next item at each position
+        neg_ids: torch.Tensor,   # (B, L) random negative at each position
     ):
-        """Training forward: returns (pos_logits, neg_logits)."""
-        u_emb   = self.user_embedding(seqs)                           # (B, d)
-        pos_emb = F.normalize(self.item_emb(pos_ids), dim=-1)         # (B, d)
-        B, K    = neg_ids.shape
-        neg_emb = F.normalize(
-            self.item_emb(neg_ids.view(-1)), dim=-1
-        ).view(B, K, self.hidden_dim)                                  # (B, K, d)
+        """Multi-position training: predict next item at every sequence position."""
+        all_h   = self.encode_sequence(seqs)                           # (B, L, d)
+        all_h   = F.normalize(all_h, dim=-1)
 
-        pos_logits = (u_emb * pos_emb).sum(dim=-1)                    # (B,)
-        neg_logits = torch.bmm(neg_emb, u_emb.unsqueeze(-1)).squeeze(-1)  # (B, K)
+        pos_emb = F.normalize(self.item_emb(pos_ids.clamp(min=1)), dim=-1)  # (B, L, d)
+        neg_emb = F.normalize(self.item_emb(neg_ids.clamp(min=1)), dim=-1)  # (B, L, d)
+
+        pos_logits = (all_h * pos_emb).sum(-1)                        # (B, L)
+        neg_logits = (all_h * neg_emb).sum(-1)                        # (B, L)
         return pos_logits, neg_logits
 
     # ------------------------------------------------------------------
     @staticmethod
-    def bce_loss(pos_logits: torch.Tensor, neg_logits: torch.Tensor) -> torch.Tensor:
+    def bce_loss(pos_logits: torch.Tensor, neg_logits: torch.Tensor,
+                 mask: torch.Tensor) -> torch.Tensor:
+        """BCE loss at valid (non-padding) positions. mask: (B, L) bool."""
         pos_loss = F.binary_cross_entropy_with_logits(
-            pos_logits, torch.ones_like(pos_logits)
+            pos_logits[mask], torch.ones(mask.sum(), device=pos_logits.device)
         )
         neg_loss = F.binary_cross_entropy_with_logits(
-            neg_logits, torch.zeros_like(neg_logits)
+            neg_logits[mask], torch.zeros(mask.sum(), device=neg_logits.device)
         )
         return pos_loss + neg_loss
