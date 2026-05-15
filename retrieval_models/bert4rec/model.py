@@ -237,38 +237,42 @@ class BERT4Rec(nn.Module):
         return F.normalize(self.embedding.token(ids), dim=-1)
 
     # ------------------------------------------------------------------
-    def forward(
-        self,
-        masked_seqs: torch.Tensor,   # (B, L) — history with MASK tokens inserted
-        pos_ids:     torch.Tensor,   # (B, L) — original items at masked positions, 0 elsewhere
-        neg_ids:     torch.Tensor,   # (B, L) — random negatives at masked positions, 0 elsewhere
-    ):
+    def forward(self, masked_seqs: torch.Tensor) -> torch.Tensor:
         """
-        Cloze forward pass: predict original items at [MASK] positions.
-        Returns pos_logits, neg_logits for BCE loss (only at masked positions).
+        Encode masked sequence.
+        masked_seqs: (B, L) — history with MASK tokens inserted.
+        Returns (B, L, d) normalized embeddings.
         """
-        all_h   = self.encode(masked_seqs)                          # (B, L, d)
-        all_h   = F.normalize(all_h, dim=-1)
-
-        pos_emb = F.normalize(self.embedding.token(pos_ids.clamp(min=1)), dim=-1)  # (B, L, d)
-        neg_emb = F.normalize(self.embedding.token(neg_ids.clamp(min=1)), dim=-1)  # (B, L, d)
-
-        pos_logits = (all_h * pos_emb).sum(-1)                      # (B, L)
-        neg_logits = (all_h * neg_emb).sum(-1)                      # (B, L)
-        return pos_logits, neg_logits
+        return F.normalize(self.encode(masked_seqs), dim=-1)
 
     # ------------------------------------------------------------------
-    @staticmethod
-    def bce_loss(
-        pos_logits: torch.Tensor,
-        neg_logits: torch.Tensor,
-        mask:       torch.Tensor,   # (B, L) bool — True at [MASK] positions
+    def infonce_loss(
+        self,
+        masked_seqs: torch.Tensor,   # (B, L)
+        pos_ids:     torch.Tensor,   # (B, L) — original items at masked pos, 0 elsewhere
+        temperature: float = 0.07,
     ) -> torch.Tensor:
-        """BCE loss computed only at masked positions."""
-        pos_loss = F.binary_cross_entropy_with_logits(
-            pos_logits[mask], torch.ones(mask.sum(), device=pos_logits.device)
-        )
-        neg_loss = F.binary_cross_entropy_with_logits(
-            neg_logits[mask], torch.zeros(mask.sum(), device=neg_logits.device)
-        )
-        return pos_loss + neg_loss
+        """
+        In-batch InfoNCE loss at [MASK] positions.
+
+        For each masked position, the positive is its original item.
+        All other positives in the same batch serve as in-batch negatives.
+        With batch_size=1024 and mask_prob=0.2 → ~10k negatives per sample.
+
+        This replaces the original 1-random-negative BCE which is too weak
+        for a 2.6M item catalog.
+        """
+        all_h      = self.forward(masked_seqs)          # (B, L, d) normalized
+        cloze_mask = pos_ids != 0                       # (B, L) bool
+
+        if cloze_mask.sum() == 0:
+            return masked_seqs.new_tensor(0.0)
+
+        h_masked   = all_h[cloze_mask]                                          # (M, d)
+        pos_items  = pos_ids[cloze_mask]                                        # (M,)
+        pos_embs   = F.normalize(self.embedding.token(pos_items), dim=-1)       # (M, d)
+
+        # (M, M) logit matrix — diagonal is positive
+        logits = h_masked @ pos_embs.T / temperature
+        labels = torch.arange(logits.size(0), device=logits.device)
+        return F.cross_entropy(logits, labels)

@@ -163,44 +163,33 @@ class BERT4RecDataset(Dataset):
 
         # Cloze masking (80/10/10 scheme from BERT paper via reference repo)
         masked_seq = seq_with_target.copy()
-        pos_ids    = np.zeros(self.maxlen, dtype=np.int64)   # label at masked positions
-        neg_ids    = np.ones(self.maxlen,  dtype=np.int64)   # neg at masked positions
+        pos_ids = np.zeros(self.maxlen, dtype=np.int64)   # original item at masked positions
 
         non_pad_positions = np.where(seq_with_target != 0)[0]
         if len(non_pad_positions) == 0:
             return (
                 torch.zeros(self.maxlen, dtype=torch.long),
                 torch.zeros(self.maxlen, dtype=torch.long),
-                torch.ones(self.maxlen,  dtype=torch.long),
             )
 
         # Decide which positions to mask
         will_mask = [p for p in non_pad_positions if random.random() < self.mask_prob]
         if not will_mask:
-            will_mask = [non_pad_positions[-1]]   # at least 1
-
-        hist_set = set(seq_with_target[seq_with_target != 0])
+            will_mask = [non_pad_positions[-1]]   # at least 1 per sample
 
         for pos in will_mask:
             orig = seq_with_target[pos]
             r    = random.random()
             if r < 0.8:
-                masked_seq[pos] = self.mask_token
+                masked_seq[pos] = self.mask_token          # 80% → [MASK]
             elif r < 0.9:
-                masked_seq[pos] = random.randint(1, self.item_num)
+                masked_seq[pos] = random.randint(1, self.item_num)  # 10% → random
             # else: keep original (10%)
-
             pos_ids[pos] = orig
-            # sample random negative
-            neg = random.randint(1, self.item_num)
-            while neg in hist_set:
-                neg = random.randint(1, self.item_num)
-            neg_ids[pos] = neg
 
         return (
             torch.from_numpy(masked_seq),
             torch.from_numpy(pos_ids),
-            torch.from_numpy(neg_ids),
         )
 
 
@@ -349,7 +338,9 @@ def parse_args():
     # Training
     p.add_argument("--epochs",     type=int,   default=5)
     p.add_argument("--batch_size", type=int,   default=1024)
-    p.add_argument("--lr",         type=float, default=1e-3)
+    p.add_argument("--lr",          type=float, default=1e-3)
+    p.add_argument("--temperature", type=float, default=0.07,
+                   help="InfoNCE temperature. Lower → harder negatives. Default 0.07.")
     p.add_argument("--max_train",  type=int,   default=None,
                    help="Cap training records. E.g. 500000 for quick test.")
     # Eval
@@ -441,10 +432,11 @@ def main():
         persistent_workers=True,
     )
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, betas=(0.9, 0.98))
+    temperature = args.temperature
 
     # ── 4. Training ────────────────────────────────────────────────────────
     print(f"\nTraining: {args.epochs} epochs × {len(dataset):,} records "
-          f"(batch={args.batch_size}, mask_prob={args.mask_prob})\n", flush=True)
+          f"(batch={args.batch_size}, mask_prob={args.mask_prob}, temp={args.temperature})\n", flush=True)
 
     start_epoch = 1
     best_r200   = 0.0
@@ -470,19 +462,13 @@ def main():
 
         pbar = tqdm(loader, desc=f"Epoch {epoch}/{args.epochs}",
                     unit="batch", dynamic_ncols=True)
-        for masked_seqs, pos_ids, neg_ids in pbar:
+        for masked_seqs, pos_ids in pbar:
             masked_seqs = masked_seqs.to(device)
             pos_ids     = pos_ids.to(device)
-            neg_ids     = neg_ids.to(device)
 
-            # Loss only at masked positions (where pos_ids != 0)
-            cloze_mask = pos_ids != 0                                # (B, L) bool
-
-            if cloze_mask.sum() == 0:
+            loss = model.infonce_loss(masked_seqs, pos_ids, temperature=temperature)
+            if loss == 0:
                 continue
-
-            pos_logits, neg_logits = model(masked_seqs, pos_ids, neg_ids)
-            loss = BERT4Rec.bce_loss(pos_logits, neg_logits, cloze_mask)
 
             optimizer.zero_grad()
             loss.backward()
