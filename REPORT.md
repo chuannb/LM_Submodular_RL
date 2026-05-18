@@ -358,4 +358,122 @@ Kết quả baseline này cho thấy pipeline hoạt động đúng về mặt k
 
 ---
 
+---
+
+## 10. BERT4Rec — Retrieval Backbone Thay thế BM25
+
+### 10.1 Động lực
+
+BM25 (Stage-1 hiện tại) có recall@200 ≈ **5.2%** — tức là 95% target items bị loại ngay từ vòng đầu, reranker và RL không có cơ hội xem xét. Mục tiêu của BERT4Rec là thay thế BM25 bằng một dense retriever có thể đẩy recall@200 lên 35–55%.
+
+### 10.2 Kiến trúc BERT4Rec
+
+BERT4Rec (Sun et al., CIKM 2019) dùng **Bidirectional Transformer** (không có causal mask) để mã hoá toàn bộ lịch sử mua hàng:
+
+```
+Lịch sử:  [i₁, i₂, ..., i_{n-1}, MASK]
+                    ↓ Bidirectional Attention (2 heads × 2 blocks)
+Embedding người dùng: h[MASK]  ∈ ℝ^128  (L2-normalized)
+
+Item embedding: E[item_id]  ∈ ℝ^128  (từ token embedding, L2-normalized)
+
+Retrieval: FAISS.search(h[MASK], top_k)  →  top-k items gần nhất
+```
+
+**Khác biệt so với SASRec (backbone trước):**
+
+| | SASRec | BERT4Rec |
+|--|--------|---------|
+| Attention | Causal (unidirectional) | Bidirectional |
+| Training task | Next-item prediction | Cloze (masked item prediction) |
+| Loss | CE / InfoNCE | In-batch InfoNCE |
+| Inference | Embedding tại vị trí cuối | Embedding tại vị trí [MASK] |
+
+### 10.3 Cấu hình mô hình
+
+| Tham số | Giá trị |
+|---------|--------|
+| `item_num` | 2,611,529 |
+| `maxlen` | 50 |
+| `hidden_dim` | 128 |
+| `num_heads` | 2 |
+| `num_blocks` | 2 |
+| `dropout` | 0.2 |
+| `mask_prob` | 0.2 |
+| Vocabulary size | 2,611,531 (items + pad + [MASK]) |
+
+### 10.4 Training
+
+**Loss: In-batch InfoNCE** (thay thế BCE 1-negative của paper gốc)
+
+```
+Với mỗi masked position trong batch:
+  - Positive: item gốc tại vị trí đó
+  - Negatives: tất cả positives khác trong batch (in-batch)
+
+logits = h_masked @ pos_embs.T / τ   (τ = 0.07)
+loss   = CrossEntropy(logits, diagonal_labels)
+```
+
+Với batch_size = 1,024 và mask_prob = 0.2 → ~200 masked positions/batch → ~200 negatives/sample. Mạnh hơn nhiều so với BCE 1-random-negative trong paper gốc, phù hợp với catalog 2.6M items.
+
+**Dữ liệu train:** 11,790,525 sequences (toàn bộ lịch sử Amazon, không giới hạn 50k users)
+
+### 10.5 Kết quả
+
+| | @10 | @50 | @100 | @200 |
+|--|----:|----:|-----:|-----:|
+| **BM25 (baseline)** | 1.5% | 3.0% | 4.2% | 5.2% |
+| **BERT4Rec (best, epoch 13)** | **4.3%** | **5.1%** | **5.6%** | **6.2%** |
+| Cải thiện | +187% | +69% | +33% | +19% |
+
+*Best checkpoint: epoch 13 — `retrieval_models/bert4rec/output/best_model.pt`*
+
+**Loss theo epoch (chọn lọc):**
+
+| Epoch | Loss | Recall@10 | Recall@200 |
+|-------|-----:|----------:|-----------:|
+| 1 | 6.564 | 3.62% | 4.96% |
+| 5 | 4.273 | 3.88% | 5.84% |
+| 10 | 3.927 | 4.12% | 6.08% |
+| **13** | **3.942** | **4.30%** | **6.16%** |
+| 20 | 3.840 | 4.22% | 6.06% |
+
+### 10.6 Phân tích
+
+**BERT4Rec tốt hơn BM25 ở recall@10 (+187%)**, nhưng chưa đạt mục tiêu recall@200 = 35–55%.
+
+**Nguyên nhân underperformance so với target:**
+
+**a) In-batch negatives quá ít** — 200 negatives/sample trong khi catalog có 2.6M items. Tỉ lệ sampling là 0.008% → các hard items phổ biến trong catalog không xuất hiện đủ như negative.
+
+**b) Recall saturate sau epoch 13** — loss tiếp tục giảm (6.56 → 3.84) nhưng recall không tăng thêm. Dấu hiệu mô hình bị overfitting trên distribution train, không generalize tốt sang test users.
+
+**c) Khoảng cách embedding không đủ phân biệt** — với 2.6M items và hidden_dim=128, không gian embedding bị chật. Items từ các categories khác nhau có cosine similarity gần nhau hơn mong đợi.
+
+**d) Vocabulary quá lớn** — 2.6M tokens vs 50-token sequences → sparse gradient updates; mỗi item chỉ được cập nhật vài lần/epoch.
+
+**So sánh với SASRec (backbone trước):**
+
+SASRec trên cùng dataset đạt recall@10 ≈ **4.3–6.0%** (theo logs SASRec). BERT4Rec đạt mức tương đương (4.3%), cho thấy với cấu hình này hai model có năng lực retrieval gần bằng nhau. BERT4Rec có lợi thế lý thuyết (bidirectional context) nhưng cần nhiều dữ liệu hơn để khai thác ưu thế đó.
+
+### 10.7 Hướng cải thiện BERT4Rec
+
+| Vấn đề | Giải pháp |
+|--------|----------|
+| In-batch negatives ít | Thêm sampled negatives từ popularity-based sampling |
+| Recall saturate | Tăng `hidden_dim` lên 256, `num_blocks` lên 4 |
+| Gradient sparse | Sub-sampling items phổ biến làm in-batch negatives thường xuyên hơn |
+| Standalone | Kết hợp BM25 + BERT4Rec qua RRF fusion để cộng hưởng điểm mạnh |
+
+**RRF fusion (đề xuất):**
+```python
+score_rrf(item) = 1/(k + rank_bm25(item)) + 1/(k + rank_bert4rec(item))
+# k = 60 (Cormack et al., 2009)
+```
+
+Dự kiến: BM25 giỏi keyword matching (queries ngắn, tên thương hiệu), BERT4Rec giỏi semantic similarity (co-purchase patterns). RRF kết hợp cả hai có thể đẩy recall@200 lên 10–15%.
+
+---
+
 *Báo cáo này được tạo tự động từ logs training. Source code: https://github.com/chuannb/LM_Submodular_RL*
